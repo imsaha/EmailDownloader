@@ -1,0 +1,22 @@
+# Build output
+bin/
+obj/
+
+# Secrets — copy appsettings.sample.json → appsettings.json and fill in your values
+appsettings.json
+
+# Downloaded emails
+output/
+
+# Claude Code
+.claude/
+
+# Visual Studio / Rider
+.vs/
+.idea/
+*.user
+*.suo
+
+# OS
+.DS_Store
+Thumbs.db
