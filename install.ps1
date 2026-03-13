@@ -24,11 +24,24 @@ New-Item -ItemType Directory -Force -Path $dest | Out-Null
 Write-Host "Downloading $tool $($release.tag_name)..." -ForegroundColor Cyan
 Invoke-WebRequest $exeAsset.browser_download_url -OutFile $exePath
 
-# Download sample config if no config exists yet
-if (-not (Test-Path $cfgPath) -and $cfgAsset) {
+# Prompt for Azure app registration details
+Write-Host ""
+Write-Host "Azure App Registration" -ForegroundColor Cyan
+$clientId = Read-Host "  ClientId  (required)"
+$tenantId  = Read-Host "  TenantId  [common]"
+if ([string]::IsNullOrWhiteSpace($tenantId)) { $tenantId = "common" }
+
+# Download sample config and apply the provided values
+if ($cfgAsset) {
     Invoke-WebRequest $cfgAsset.browser_download_url -OutFile $cfgPath
-    Write-Host "Config template saved to: $cfgPath" -ForegroundColor Yellow
-    Write-Host "Edit it and add your Azure ClientId before first use." -ForegroundColor Yellow
+}
+
+if (Test-Path $cfgPath) {
+    $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
+    $cfg.AzureAd.ClientId = $clientId
+    $cfg.AzureAd.TenantId = $tenantId
+    $cfg | ConvertTo-Json -Depth 10 | Set-Content $cfgPath
+    Write-Host "Config written to: $cfgPath" -ForegroundColor Green
 }
 
 # Add to PATH (current user, no admin required)
