@@ -6,23 +6,32 @@ A .NET 10 console application that authenticates via **OpenID Connect**, downloa
 
 ## Install
 
+**Windows (PowerShell):**
+
 ```powershell
 irm https://raw.githubusercontent.com/imsaha/EmailDownloader/master/install.ps1 | iex
 ```
 
+**macOS:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/imsaha/EmailDownloader/master/install.sh | bash
+```
+
 The installer will:
-1. Download the latest `emaildl.exe` from GitHub Releases
+
+1. Detect your platform and download the correct binary from GitHub Releases
 2. Prompt for your **Azure AD ClientId** and **TenantId** (default: `common`)
 3. Write `appsettings.json` with your credentials
-4. Add the install directory to your user `PATH`
+4. Add the install directory to your `PATH`
 
-Re-running the same command updates the exe if a newer version exists; existing config is never overwritten.
+Re-running the same command updates the binary if a newer version exists; existing config is never overwritten.
 
 ---
 
 ## Upgrade
 
-```powershell
+```bash
 emaildl upgrade
 ```
 
@@ -32,11 +41,11 @@ Checks GitHub for a newer release. If one is found, prompts for confirmation the
 
 ## Uninstall
 
-```powershell
+```bash
 emaildl uninstall
 ```
 
-Removes the install directory and cleans up `PATH`.
+Removes the install directory and cleans up `PATH` (user PATH on Windows; shell profile entries on macOS).
 
 ---
 

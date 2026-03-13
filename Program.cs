@@ -66,28 +66,60 @@ static internal class Program
             return 0;
         }
 
-        // Remove from user PATH
-        var currentPath = Environment.GetEnvironmentVariable("PATH", EnvironmentVariableTarget.User) ?? "";
-        var entries = currentPath.Split(';').Where(e => !e.TrimEnd('\\', '/').Equals(
-            installDir.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase));
-        Environment.SetEnvironmentVariable("PATH", string.Join(';', entries), EnvironmentVariableTarget.User);
-        AnsiConsole.MarkupLine("[green]Removed from PATH.[/]");
-
-        // Schedule directory deletion after process exits (can't delete the running exe on Windows)
-        var bat = Path.Combine(Path.GetTempPath(), "emaildl_uninstall.bat");
-        File.WriteAllText(bat,
-            $"""
-            @echo off
-            ping -n 3 127.0.0.1 >nul
-            rd /s /q "{installDir}"
-            del "%~f0"
-            """);
-        Process.Start(new ProcessStartInfo("cmd.exe", $"/c \"{bat}\"")
+        if (OperatingSystem.IsWindows())
         {
-            CreateNoWindow = true,
-            UseShellExecute = false
-        });
+            // Remove from user PATH
+            var currentPath = Environment.GetEnvironmentVariable("PATH", EnvironmentVariableTarget.User) ?? "";
+            var entries = currentPath.Split(';').Where(e => !e.TrimEnd('\\', '/').Equals(
+                installDir.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase));
+            Environment.SetEnvironmentVariable("PATH", string.Join(';', entries), EnvironmentVariableTarget.User);
 
+            // Schedule directory deletion after process exits (can't delete the running exe on Windows)
+            var bat = Path.Combine(Path.GetTempPath(), "emaildl_uninstall.bat");
+            File.WriteAllText(bat,
+                $"""
+                @echo off
+                ping -n 3 127.0.0.1 >nul
+                rd /s /q "{installDir}"
+                del "%~f0"
+                """);
+            Process.Start(new ProcessStartInfo("cmd.exe", $"/c \"{bat}\"")
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false
+            });
+        }
+        else
+        {
+            // Remove from shell profiles
+            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            foreach (var profile in new[] { ".zshrc", ".bash_profile", ".bashrc" }
+                         .Select(f => Path.Combine(home, f))
+                         .Where(File.Exists))
+            {
+                var lines = File.ReadAllLines(profile)
+                    .Where(l => !l.Contains(installDir) && l != "# emaildl")
+                    .ToArray();
+                File.WriteAllLines(profile, lines);
+            }
+
+            var sh = Path.Combine(Path.GetTempPath(), "emaildl_uninstall.sh");
+            File.WriteAllText(sh,
+                $"""
+                #!/bin/bash
+                sleep 2
+                rm -rf "{installDir}"
+                rm -- "$0"
+                """);
+            File.SetUnixFileMode(sh, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            Process.Start(new ProcessStartInfo("bash", sh)
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false
+            });
+        }
+
+        AnsiConsole.MarkupLine("[green]Removed from PATH.[/]");
         AnsiConsole.MarkupLine("[green]emaildl uninstalled.[/]");
         return 0;
     }
@@ -125,10 +157,16 @@ static internal class Program
             var root = doc.RootElement;
             latestTag = root.GetProperty("tag_name").GetString()!;
 
+            var assetName = OperatingSystem.IsWindows() ? $"{tool}.exe"
+                : System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture
+                  == System.Runtime.InteropServices.Architecture.Arm64
+                    ? $"{tool}-osx-arm64"
+                    : $"{tool}-osx-x64";
+
             downloadUrl = root
                 .GetProperty("assets")
                 .EnumerateArray()
-                .First(a => a.GetProperty("name").GetString() == $"{tool}.exe")
+                .First(a => a.GetProperty("name").GetString() == assetName)
                 .GetProperty("browser_download_url")
                 .GetString()!;
         }
@@ -179,22 +217,43 @@ static internal class Program
             return 1;
         }
 
-        // Schedule replacement via batch script (can't overwrite running exe on Windows)
-        var bat = Path.Combine(Path.GetTempPath(), "emaildl_upgrade.bat");
-        File.WriteAllText(bat,
-            $"""
-            @echo off
-            ping -n 3 127.0.0.1 >nul
-            move /y "{tmpExe}" "{exePath}"
-            echo {latestTag}> "{versionFile}"
-            del "%~f0"
-            """);
-
-        Process.Start(new ProcessStartInfo("cmd.exe", $"/c \"{bat}\"")
+        // Schedule replacement after process exits
+        if (OperatingSystem.IsWindows())
         {
-            CreateNoWindow = true,
-            UseShellExecute = false
-        });
+            var bat = Path.Combine(Path.GetTempPath(), "emaildl_upgrade.bat");
+            File.WriteAllText(bat,
+                $"""
+                @echo off
+                ping -n 3 127.0.0.1 >nul
+                move /y "{tmpExe}" "{exePath}"
+                echo {latestTag}> "{versionFile}"
+                del "%~f0"
+                """);
+            Process.Start(new ProcessStartInfo("cmd.exe", $"/c \"{bat}\"")
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false
+            });
+        }
+        else
+        {
+            var sh = Path.Combine(Path.GetTempPath(), "emaildl_upgrade.sh");
+            File.WriteAllText(sh,
+                $"""
+                #!/bin/bash
+                sleep 2
+                mv "{tmpExe}" "{exePath}"
+                chmod +x "{exePath}"
+                echo "{latestTag}" > "{versionFile}"
+                rm -- "$0"
+                """);
+            File.SetUnixFileMode(sh, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            Process.Start(new ProcessStartInfo("bash", sh)
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false
+            });
+        }
 
         AnsiConsole.MarkupLine($"[green]✅ Upgrade to {latestTag} will complete in a moment.[/]");
         AnsiConsole.MarkupLine("[grey](The new binary replaces the old one after this process exits.)[/]");
