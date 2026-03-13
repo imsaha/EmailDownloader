@@ -1,7 +1,7 @@
 # EmailDownloader installer
 # Usage: irm https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/master/install.ps1 | iex
 
-$repo    = "YOUR_USER/YOUR_REPO"   # <-- update this
+$repo    = "imsaha/EmailDownloader"   # <-- update this
 $tool    = "emaildl"
 $dest    = "$env:USERPROFILE\.tools\$tool"
 $exePath = "$dest\$tool.exe"
