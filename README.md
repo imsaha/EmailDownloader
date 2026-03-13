@@ -20,6 +20,16 @@ Re-running the same command updates the exe if a newer version exists; existing 
 
 ---
 
+## Upgrade
+
+```powershell
+emaildl upgrade
+```
+
+Checks GitHub for a newer release. If one is found, prompts for confirmation then downloads and replaces the binary automatically. Your `appsettings.json` is never touched.
+
+---
+
 ## Uninstall
 
 ```powershell

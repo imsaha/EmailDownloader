@@ -21,6 +21,9 @@ static internal class Program
         if (args.Length > 0 && args[0].Equals("uninstall", StringComparison.OrdinalIgnoreCase))
             return Uninstall();
 
+        if (args.Length > 0 && args[0].Equals("upgrade", StringComparison.OrdinalIgnoreCase))
+            return await UpgradeAsync();
+
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) =>
         {
@@ -86,6 +89,115 @@ static internal class Program
         });
 
         AnsiConsole.MarkupLine("[green]emaildl uninstalled.[/]");
+        return 0;
+    }
+
+    private static async Task<int> UpgradeAsync()
+    {
+        const string repo = "imsaha/EmailDownloader";
+        const string tool = "emaildl";
+
+        var installDir  = Path.GetDirectoryName(Environment.ProcessPath)!;
+        var exePath     = Environment.ProcessPath!;
+        var versionFile = Path.Combine(installDir, "version.txt");
+
+        AnsiConsole.Write(new Rule("[bold cyan]Upgrade emaildl[/]").RuleStyle("cyan"));
+        AnsiConsole.WriteLine();
+
+        var installedTag = File.Exists(versionFile)
+            ? File.ReadAllText(versionFile).Trim()
+            : "(unknown)";
+
+        AnsiConsole.MarkupLine($"[white]Installed version:[/] [yellow]{installedTag}[/]");
+
+        // Fetch latest release from GitHub
+        string latestTag;
+        string downloadUrl;
+        try
+        {
+            using var http = new System.Net.Http.HttpClient();
+            http.DefaultRequestHeaders.Add("User-Agent", tool);
+            var json = await http.GetStringAsync(
+                $"https://api.github.com/repos/{repo}/releases/latest");
+
+            // Parse with System.Text.Json
+            using var doc = System.Text.Json.JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            latestTag = root.GetProperty("tag_name").GetString()!;
+
+            downloadUrl = root
+                .GetProperty("assets")
+                .EnumerateArray()
+                .First(a => a.GetProperty("name").GetString() == $"{tool}.exe")
+                .GetProperty("browser_download_url")
+                .GetString()!;
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[red]❌ Failed to fetch release info: {ex.Message}[/]");
+            return 1;
+        }
+
+        AnsiConsole.MarkupLine($"[white]Latest version: [/] [cyan]{latestTag}[/]");
+        AnsiConsole.WriteLine();
+
+        if (installedTag == latestTag)
+        {
+            AnsiConsole.MarkupLine($"[green]✅ Already up to date ({latestTag}).[/]");
+            return 0;
+        }
+
+        var confirm = AnsiConsole.Prompt(
+            new SelectionPrompt<string>()
+                .Title($"[bold]Upgrade {tool} {installedTag} → {latestTag}?[/]")
+                .AddChoices("✅  Yes, upgrade", "❌  No, cancel"));
+
+        if (confirm.StartsWith("❌"))
+        {
+            AnsiConsole.MarkupLine("[grey]Upgrade cancelled.[/]");
+            return 0;
+        }
+
+        // Download new exe to a temp path beside the current exe
+        var tmpExe = exePath + ".new";
+        try
+        {
+            await AnsiConsole.Status()
+                .Spinner(Spinner.Known.Dots)
+                .SpinnerStyle(Style.Parse("cyan"))
+                .StartAsync($"Downloading {latestTag}...", async _ =>
+                {
+                    using var http = new System.Net.Http.HttpClient();
+                    http.DefaultRequestHeaders.Add("User-Agent", tool);
+                    var bytes = await http.GetByteArrayAsync(downloadUrl);
+                    await File.WriteAllBytesAsync(tmpExe, bytes);
+                });
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[red]❌ Download failed: {ex.Message}[/]");
+            return 1;
+        }
+
+        // Schedule replacement via batch script (can't overwrite running exe on Windows)
+        var bat = Path.Combine(Path.GetTempPath(), "emaildl_upgrade.bat");
+        File.WriteAllText(bat,
+            $"""
+            @echo off
+            ping -n 3 127.0.0.1 >nul
+            move /y "{tmpExe}" "{exePath}"
+            echo {latestTag}> "{versionFile}"
+            del "%~f0"
+            """);
+
+        Process.Start(new ProcessStartInfo("cmd.exe", $"/c \"{bat}\"")
+        {
+            CreateNoWindow = true,
+            UseShellExecute = false
+        });
+
+        AnsiConsole.MarkupLine($"[green]✅ Upgrade to {latestTag} will complete in a moment.[/]");
+        AnsiConsole.MarkupLine("[grey](The new binary replaces the old one after this process exits.)[/]");
         return 0;
     }
 
