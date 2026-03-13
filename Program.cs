@@ -22,9 +22,27 @@ static internal class Program
         {
             e.Cancel = true;
             cts.Cancel();
-            AnsiConsole.MarkupLine("\n[yellow]⚠ Cancelled.[/]");
         };
 
+        try
+        {
+            int result;
+            do { result = await RunAsync(cts, args); }
+            while (result == RestartCode && !cts.IsCancellationRequested);
+            return result == RestartCode ? 0 : result;
+        }
+        catch (OperationCanceledException)
+        {
+            AnsiConsole.MarkupLine("\n[yellow]⚠ Cancelled.[/]");
+            PressAnyKey();
+            return 0;
+        }
+    }
+
+    private const int RestartCode = -99;
+
+    private static async Task<int> RunAsync(CancellationTokenSource cts, string[] args)
+    {
         PrintBanner();
 
         // ── Configuration ─────────────────────────────────────────────────────
@@ -54,14 +72,24 @@ static internal class Program
 
         // ── Auth Flow Selection ────────────────────────────────────────────────
         AnsiConsole.WriteLine();
+
+        var cachedEmail = await AnsiConsole.Status()
+            .Spinner(Spinner.Known.Dots)
+            .SpinnerStyle(Style.Parse("grey"))
+            .StartAsync("Checking for saved session...",
+                async _ => await Auth.TokenCacheHelper.GetCachedAccountEmailAsync(appConfig.AzureAd));
+
+        var authChoices = new List<string>();
+        if (cachedEmail != null)
+            authChoices.Add($"⚡  Use saved session ({cachedEmail})");
+        authChoices.Add("🌐  Browser (Interactive - Recommended)");
+        authChoices.Add("📱  Device Code (for headless/server environments)");
+        authChoices.Add("❌  Exit");
+
         var authMethod = AnsiConsole.Prompt(
             new SelectionPrompt<string>()
                 .Title("[bold]Choose authentication method:[/]")
-                .AddChoices(
-                    "🌐  Browser (Interactive - Recommended)",
-                    "📱  Device Code (for headless/server environments)",
-                    "❌  Exit"
-                ));
+                .AddChoices(authChoices));
 
         if (authMethod.StartsWith("❌")) return 0;
 
@@ -76,10 +104,10 @@ static internal class Program
         services.AddSingleton(appConfig.AzureAd);
         services.AddSingleton(appConfig.Download);
 
-        if (authMethod.StartsWith("🌐"))
-            services.AddSingleton<IAuthService, MsalAuthService>();
-        else
+        if (authMethod.StartsWith("📱"))
             services.AddSingleton<IAuthService, DeviceCodeAuthService>();
+        else
+            services.AddSingleton<IAuthService, MsalAuthService>(); // covers browser + saved session
 
         services.AddSingleton<IEmailService, GraphEmailService>();
         services.AddSingleton<ConsoleProgressDisplay>();
@@ -103,7 +131,8 @@ static internal class Program
         }
         catch (OperationCanceledException)
         {
-            AnsiConsole.MarkupLine("[yellow]Authentication cancelled.[/]");
+            AnsiConsole.MarkupLine("\n[yellow]⚠ Cancelled.[/]");
+            PressAnyKey();
             return 0;
         }
         catch (Exception ex)
@@ -130,7 +159,8 @@ static internal class Program
         }
         catch (OperationCanceledException)
         {
-            AnsiConsole.MarkupLine("[yellow]Cancelled.[/]");
+            AnsiConsole.MarkupLine("\n[yellow]⚠ Cancelled.[/]");
+            PressAnyKey();
             return 0;
         }
         catch (Exception ex)
@@ -147,135 +177,239 @@ static internal class Program
 
         PrintFolderSummary(folders);
 
-        var totalMessages = folders.Sum(f => f.TotalItemCount);
         var outputPath = Path.GetFullPath(appConfig.Download.OutputPath);
 
-        // ── Step 3: Folder Selection ───────────────────────────────────────────
-        AnsiConsole.WriteLine();
-        AnsiConsole.Write(new Rule("[bold yellow]Step 3 — Options[/]").RuleStyle("yellow"));
-        AnsiConsole.WriteLine();
-
-        var folderChoice = AnsiConsole.Prompt(
-            new SelectionPrompt<string>()
-                .Title("[bold]Which folders do you want to download?[/]")
-                .AddChoices(
-                    "✅  All folders",
-                    "🔍  Let me choose specific folders",
-                    "❌  Cancel"
-                ));
-
-        if (folderChoice.StartsWith("❌")) return 0;
-
-        if (folderChoice.StartsWith("🔍"))
-        {
-            var selected = AnsiConsole.Prompt(
-                new MultiSelectionPrompt<string>()
-                    .Title("Select folders to download:")
-                    .InstructionsText("[grey](Space to select, Enter to confirm)[/]")
-                    .AddChoices(folders.Select(f =>
-                        $"{f.DisplayName} ({f.TotalItemCount:N0} messages)")));
-
-            folders = folders.Where(f =>
-                selected.Any(s => s.StartsWith(f.DisplayName + " "))).ToList();
-
-            if (folders.Count == 0)
-            {
-                AnsiConsole.MarkupLine("[yellow]No folders selected.[/]");
-                return 0;
-            }
-        }
-
-        // ── Date Range Filter ──────────────────────────────────────────────────
-        AnsiConsole.WriteLine();
-        var useDateFilter = AnsiConsole.Prompt(
-            new SelectionPrompt<string>()
-                .Title("[bold]Filter emails by date range?[/]")
-                .AddChoices(
-                    "📅  Yes, specify a date range",
-                    "⏭️   No, download all dates"
-                ));
-
+        // ── Navigable wizard (steps 3-6) ──────────────────────────────────────
+        // step 0 = folder choice, 1 = specific picker, 2 = date range,
+        // 3 = confirm, 4 = delete choice  (step 5 = done → exit loop)
+        List<Email.MailFolder> wizardFolders = folders.ToList();
+        bool specificFolders = false;
         DateTimeOffset? fromDate = null;
         DateTimeOffset? untilDate = null;
+        bool deleteAfterDownload = false;
+        int step = 0;
 
-        if (useDateFilter.StartsWith("📅"))
+        while (step <= 4)
         {
-            fromDate = PromptDate("Enter [cyan]start date[/] (from, inclusive)", allowEmpty: true,
-                hint: "leave blank for no lower bound");
-
-            var rawUntil = PromptDate("Enter [cyan]end date[/] (until, inclusive)", allowEmpty: true,
-                hint: "leave blank for no upper bound");
-            // Shift to end of day so the until date is fully inclusive
-            untilDate = rawUntil.HasValue
-                ? rawUntil.Value.AddDays(1).AddSeconds(-1)
-                : null;
-
-            if (fromDate.HasValue && untilDate.HasValue && fromDate > untilDate)
+            switch (step)
             {
-                AnsiConsole.MarkupLine("[yellow]⚠  Start date is after end date — swapping them.[/]");
-                (fromDate, untilDate) = (untilDate, fromDate);
+                // ── 0: Which folders? ──────────────────────────────────────────
+                case 0:
+                {
+                    AnsiConsole.WriteLine();
+                    AnsiConsole.Write(new Rule("[bold yellow]Step 3 — Options[/]").RuleStyle("yellow"));
+                    AnsiConsole.WriteLine();
+
+                    var choice = AnsiConsole.Prompt(
+                        new SelectionPrompt<string>()
+                            .Title("[bold]Which folders do you want to download?[/]")
+                            .AddChoices(
+                                "✅  All folders",
+                                "🔍  Let me choose specific folders",
+                                "❌  Cancel",
+                                "🔄  Start again"));
+
+                    if (choice.StartsWith("❌")) return 0;
+                    if (choice.StartsWith("🔄")) return RestartCode;
+
+                    specificFolders = choice.StartsWith("🔍");
+                    wizardFolders = folders.ToList(); // reset any prior selection
+                    step++;
+                    break;
+                }
+
+                // ── 1: Specific folder multi-picker ────────────────────────────
+                case 1:
+                {
+                    if (!specificFolders) { step++; break; }
+
+                    var orderedFolders = folders.OrderBy(f => f.Path).ToList();
+                    var displayStrings = orderedFolders.Select(f =>
+                    {
+                        var depth = f.Path.Count(c => c == '/');
+                        return $"{new string(' ', depth * 2)}{f.DisplayName} ({f.TotalItemCount:N0} messages)";
+                    }).ToList();
+
+                    var selected = AnsiConsole.Prompt(
+                        new MultiSelectionPrompt<string>()
+                            .Title("Select folders to download [grey](child folders included automatically)[/]:")
+                            .InstructionsText("[grey](Space to select, Enter to confirm)[/]")
+                            .AddChoices(displayStrings));
+
+                    var selectedPaths = orderedFolders
+                        .Where((_, i) => selected.Contains(displayStrings[i]))
+                        .Select(f => f.Path)
+                        .ToHashSet();
+
+                    var picked = folders
+                        .Where(f => selectedPaths.Any(p => f.Path == p || f.Path.StartsWith(p + "/")))
+                        .ToList();
+
+                    if (picked.Count == 0)
+                    {
+                        AnsiConsole.MarkupLine("[yellow]No folders selected.[/]");
+                        continue; // re-show picker
+                    }
+
+                    // Post-selection nav — multi-select has no room for nav items
+                    var nav = AnsiConsole.Prompt(
+                        new SelectionPrompt<string>()
+                            .Title($"[bold]{picked.Count} folder(s) selected — continue?[/]")
+                            .AddChoices(
+                                $"✅  Continue with {picked.Count} folder(s)",
+                                "↩  Back",
+                                "🔄  Start again"));
+
+                    if (nav.StartsWith("🔄")) return RestartCode;
+                    if (nav.StartsWith("↩")) { step--; break; }
+
+                    wizardFolders = picked;
+                    step++;
+                    break;
+                }
+
+                // ── 2: Date range ──────────────────────────────────────────────
+                case 2:
+                {
+                    AnsiConsole.WriteLine();
+                    var useDateFilter = AnsiConsole.Prompt(
+                        new SelectionPrompt<string>()
+                            .Title("[bold]Filter emails by date range?[/]")
+                            .AddChoices(
+                                "📅  Yes, specify a date range",
+                                "⏭️   No, download all dates",
+                                "↩  Back",
+                                "🔄  Start again"));
+
+                    if (useDateFilter.StartsWith("🔄")) return RestartCode;
+                    if (useDateFilter.StartsWith("↩"))
+                    {
+                        fromDate = null; untilDate = null;
+                        step = specificFolders ? 1 : 0;
+                        break;
+                    }
+
+                    fromDate = null;
+                    untilDate = null;
+
+                    if (useDateFilter.StartsWith("📅"))
+                    {
+                        var (fd, fbBack, fbRestart) = PromptDate(
+                            "Enter [cyan]start date[/] (from, inclusive)", allowEmpty: true,
+                            hint: "blank = no lower bound  •  'back' to go back");
+                        if (fbRestart) return RestartCode;
+                        if (fbBack) break; // re-show this step
+
+                        var (rd, rbBack, rbRestart) = PromptDate(
+                            "Enter [cyan]end date[/] (until, inclusive)", allowEmpty: true,
+                            hint: "blank = no upper bound  •  'back' to go back");
+                        if (rbRestart) return RestartCode;
+                        if (rbBack) break; // re-show this step
+
+                        fromDate = fd;
+                        untilDate = rd.HasValue ? rd.Value.AddDays(1).AddSeconds(-1) : null;
+
+                        if (fromDate.HasValue && untilDate.HasValue && fromDate > untilDate)
+                        {
+                            AnsiConsole.MarkupLine("[yellow]⚠  Start date is after end date — swapping them.[/]");
+                            (fromDate, untilDate) = (untilDate, fromDate);
+                        }
+                    }
+
+                    step++;
+                    break;
+                }
+
+                // ── 3: Confirmation panel ──────────────────────────────────────
+                case 3:
+                {
+                    AnsiConsole.WriteLine();
+
+                    var totalMessages = wizardFolders.Sum(f => f.TotalItemCount);
+                    var dateFiltered = fromDate.HasValue || untilDate.HasValue;
+                    var messagesDisplay = dateFiltered
+                        ? $"[bold yellow]≤{totalMessages:N0}[/] [dim](date filter will reduce this)[/]"
+                        : $"[bold yellow]{totalMessages:N0}[/]";
+
+                    var dateRangeDisplay = (fromDate, untilDate) switch
+                    {
+                        (not null, not null) => $"[cyan]{fromDate.Value:yyyy-MM-dd}[/] → [cyan]{untilDate.Value:yyyy-MM-dd}[/]",
+                        (not null, null)     => $"[cyan]{fromDate.Value:yyyy-MM-dd}[/] → [dim](no end)[/]",
+                        (null, not null)     => $"[dim](no start)[/] → [cyan]{untilDate.Value:yyyy-MM-dd}[/]",
+                        _                    => "[dim]all dates[/]"
+                    };
+
+                    AnsiConsole.Write(new Panel(
+                        $"[white]Account:[/]  [bold cyan]{authResult.UserEmail}[/]\n" +
+                        $"[white]Folders:[/]  [bold]{wizardFolders.Count}[/]\n" +
+                        $"[white]Messages:[/] {messagesDisplay}\n" +
+                        $"[white]Dates:[/]    {dateRangeDisplay}\n" +
+                        $"[white]Output:[/]   [dim]{outputPath}[/]\n" +
+                        $"[white]Format:[/]   [bold].EML[/] files grouped by year/folder")
+                    {
+                        Header = new PanelHeader("[bold]⚠  Ready to Download[/]"),
+                        Border = BoxBorder.Double,
+                        BorderStyle = Style.Parse("yellow"),
+                        Padding = new Padding(2, 1)
+                    });
+
+                    AnsiConsole.WriteLine();
+
+                    var confirmed = AnsiConsole.Prompt(
+                        new SelectionPrompt<string>()
+                            .Title("[bold]Do you want to start downloading?[/]")
+                            .AddChoices(
+                                "✅  Yes, start downloading",
+                                "↩  Back",
+                                "🔄  Start again"));
+
+                    if (confirmed.StartsWith("🔄")) return RestartCode;
+                    if (confirmed.StartsWith("↩")) { step--; break; }
+
+                    step++;
+                    break;
+                }
+
+                // ── 4: Delete after download ───────────────────────────────────
+                case 4:
+                {
+                    AnsiConsole.WriteLine();
+                    var deleteChoice = AnsiConsole.Prompt(
+                        new SelectionPrompt<string>()
+                            .Title("[bold]Delete emails from server after downloading?[/]")
+                            .AddChoices(
+                                "🚫  No, keep emails on server (recommended)",
+                                "🗑️   Yes, delete from server after download",
+                                "↩  Back",
+                                "🔄  Start again"));
+
+                    if (deleteChoice.StartsWith("🔄")) return RestartCode;
+                    if (deleteChoice.StartsWith("↩")) { step--; break; }
+
+                    deleteAfterDownload = deleteChoice.StartsWith("🗑");
+
+                    if (deleteAfterDownload)
+                    {
+                        AnsiConsole.MarkupLine("[bold red]⚠  Emails will be permanently deleted from the server after download.[/]");
+                        var confirmDelete = AnsiConsole.Prompt(
+                            new SelectionPrompt<string>()
+                                .Title("[bold red]Are you absolutely sure?[/]")
+                                .AddChoices(
+                                    "✅  Yes, I understand — proceed",
+                                    "↩  Back",
+                                    "🔄  Start again"));
+
+                        if (confirmDelete.StartsWith("🔄")) return RestartCode;
+                        if (confirmDelete.StartsWith("↩")) { deleteAfterDownload = false; break; } // re-show step 4
+                    }
+
+                    step++;
+                    break;
+                }
             }
         }
 
-        // ── Confirmation Panel ─────────────────────────────────────────────────
-        AnsiConsole.WriteLine();
-
-        var dateRangeDisplay = (fromDate, untilDate) switch
-        {
-            (not null, not null) => $"[cyan]{fromDate.Value:yyyy-MM-dd}[/] → [cyan]{untilDate.Value:yyyy-MM-dd}[/]",
-            (not null, null)     => $"[cyan]{fromDate.Value:yyyy-MM-dd}[/] → [dim](no end)[/]",
-            (null, not null)     => $"[dim](no start)[/] → [cyan]{untilDate.Value:yyyy-MM-dd}[/]",
-            _                    => "[dim]all dates[/]"
-        };
-
-        AnsiConsole.Write(new Panel(
-            $"[white]Account:[/]  [bold cyan]{authResult.UserEmail}[/]\n" +
-            $"[white]Folders:[/]  [bold]{folders.Count}[/]\n" +
-            $"[white]Messages:[/] [bold yellow]~{totalMessages:N0}[/] total\n" +
-            $"[white]Dates:[/]    {dateRangeDisplay}\n" +
-            $"[white]Output:[/]   [dim]{outputPath}[/]\n" +
-            $"[white]Format:[/]   [bold].EML[/] files grouped by year/folder")
-        {
-            Header = new PanelHeader("[bold]⚠  Ready to Download[/]"),
-            Border = BoxBorder.Double,
-            BorderStyle = Style.Parse("yellow"),
-            Padding = new Padding(2, 1)
-        });
-
-        AnsiConsole.WriteLine();
-
-        var confirmed = AnsiConsole.Prompt(
-            new SelectionPrompt<string>()
-                .Title("[bold]Do you want to start downloading?[/]")
-                .AddChoices(
-                    "✅  Yes, start downloading",
-                    "❌  Cancel"
-                ));
-
-        if (confirmed.StartsWith("❌")) return 0;
-
-        // ── Delete After Download Prompt ───────────────────────────────────────
-        AnsiConsole.WriteLine();
-        var deleteChoice = AnsiConsole.Prompt(
-            new SelectionPrompt<string>()
-                .Title("[bold]Delete emails from server after downloading?[/]")
-                .AddChoices(
-                    "🚫  No, keep emails on server (recommended)",
-                    "🗑️   Yes, delete from server after download"
-                ));
-
-        var deleteAfterDownload = deleteChoice.StartsWith("🗑");
-
-        if (deleteAfterDownload)
-        {
-            AnsiConsole.MarkupLine("[bold red]⚠  Emails will be permanently deleted from the server after download.[/]");
-            var confirmDelete = AnsiConsole.Prompt(
-                new SelectionPrompt<string>()
-                    .Title("[bold red]Are you absolutely sure?[/]")
-                    .AddChoices("❌  No, cancel", "✅  Yes, I understand — proceed"));
-
-            if (confirmDelete.StartsWith("❌")) return 0;
-        }
+        folders = wizardFolders;
 
         // ── Download Loop ──────────────────────────────────────────────────────
         AnsiConsole.WriteLine();
@@ -467,10 +601,12 @@ static internal class Program
             .AddColumn("[bold]Total[/]", c => c.RightAligned())
             .AddColumn("[bold]Unread[/]", c => c.RightAligned());
 
-        foreach (var f in folders.OrderByDescending(x => x.TotalItemCount))
+        foreach (var f in folders.OrderBy(x => x.Path))
         {
+            var depth = f.Path.Count(c => c == '/');
+            var indent = new string(' ', depth * 2);
             table.AddRow(
-                $"[white]{f.DisplayName}[/]",
+                $"[white]{indent}{f.DisplayName}[/]",
                 $"[yellow]{f.TotalItemCount:N0}[/]",
                 f.UnreadItemCount > 0
                     ? $"[cyan]{f.UnreadItemCount:N0}[/]"
@@ -512,7 +648,8 @@ static internal class Program
     private static string Truncate(string s, int max) =>
         s.Length <= max ? s : s[..(max - 1)] + "…";
 
-    private static DateTimeOffset? PromptDate(string title, bool allowEmpty, string hint = "")
+    private static (DateTimeOffset? Value, bool GoBack, bool Restart) PromptDate(
+        string title, bool allowEmpty, string hint = "")
     {
         var hintText = hint.Length > 0 ? $" [grey]({hint})[/]" : "";
         while (true)
@@ -521,17 +658,18 @@ static internal class Program
                 new TextPrompt<string>($"{title}{hintText} [[yyyy-MM-dd]]:")
                     .AllowEmpty());
 
+            var trimmed = input.Trim().ToLowerInvariant();
+            if (trimmed is "back" or "b") return (null, true, false);
+            if (trimmed is "restart" or "start again" or "r") return (null, false, true);
+
             if (string.IsNullOrWhiteSpace(input) && allowEmpty)
-                return null;
+                return (null, false, false);
 
             if (DateOnly.TryParseExact(input.Trim(), "yyyy-MM-dd",
                     System.Globalization.CultureInfo.InvariantCulture,
                     System.Globalization.DateTimeStyles.None, out var date))
             {
-                // "from" → start of day UTC; "until" → end of day UTC
-                // Caller decides which by the title; we return midnight and let
-                // the caller set end-of-day via the untilDate path.
-                return new DateTimeOffset(date.Year, date.Month, date.Day, 0, 0, 0, TimeSpan.Zero);
+                return (new DateTimeOffset(date.Year, date.Month, date.Day, 0, 0, 0, TimeSpan.Zero), false, false);
             }
 
             AnsiConsole.MarkupLine("[red]Invalid date. Use format yyyy-MM-dd (e.g. 2023-06-15).[/]");

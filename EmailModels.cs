@@ -40,6 +40,9 @@ public sealed record MailFolder
     public int TotalItemCount { get; init; }
     public int UnreadItemCount { get; init; }
     public string ParentFolderId { get; init; } = string.Empty;
+    /// <summary>Full slash-separated path, e.g. "Inbox/Work/Projects".</summary>
+    public string Path { get; init; } = string.Empty;
+    public int ChildFolderCount { get; init; }
 }
 
 public sealed record DownloadStats

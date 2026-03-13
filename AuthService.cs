@@ -1,10 +1,8 @@
-using System.Diagnostics;
-using System.Net;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using EmailDownloader.Config;
 using Microsoft.Identity.Client;
+using Microsoft.Identity.Client.Extensions.Msal;
 using Spectre.Console;
 
 namespace EmailDownloader.Auth;
@@ -34,40 +32,40 @@ public sealed class MsalAuthService : IAuthService
         _config = config;
     }
 
-    private IPublicClientApplication BuildApp()
+    private async Task<IPublicClientApplication> BuildAppAsync()
     {
-        return PublicClientApplicationBuilder
+        var app = PublicClientApplicationBuilder
             .Create(_config.ClientId)
             .WithAuthority(AzureCloudInstance.AzurePublic, _config.TenantId)
             .WithRedirectUri(_config.RedirectUri)
             .Build();
+        await TokenCacheHelper.RegisterAsync(app);
+        return app;
     }
 
     public async Task<AuthResult> AuthenticateAsync(CancellationToken ct = default)
     {
-        _app = BuildApp();
-
-        AnsiConsole.MarkupLine("[bold yellow]⚡ Initiating OpenID Connect authentication...[/]");
-        AnsiConsole.MarkupLine("[grey]A browser window will open for you to sign in.[/]");
-        AnsiConsole.WriteLine();
+        _app = await BuildAppAsync();
 
         AuthenticationResult result;
 
         try
         {
-            // Try silent first (cached token)
             var accounts = await _app.GetAccountsAsync();
             var account = accounts.FirstOrDefault();
 
             if (account != null)
             {
-                AnsiConsole.MarkupLine("[grey]Found cached account, attempting silent sign-in...[/]");
+                // Refresh token available — sign in silently without a browser
                 result = await _app.AcquireTokenSilent(_config.Scopes, account)
                     .ExecuteAsync(ct);
             }
             else
             {
-                // Interactive login via system browser
+                AnsiConsole.MarkupLine("[bold yellow]⚡ Initiating OpenID Connect authentication...[/]");
+                AnsiConsole.MarkupLine("[grey]A browser window will open for you to sign in.[/]");
+                AnsiConsole.WriteLine();
+
                 result = await _app.AcquireTokenInteractive(_config.Scopes)
                     .WithPrompt(Prompt.SelectAccount)
                     .WithUseEmbeddedWebView(false)
@@ -76,7 +74,11 @@ public sealed class MsalAuthService : IAuthService
         }
         catch (MsalUiRequiredException)
         {
-            // Silent failed, go interactive
+            // Silent failed — refresh token expired or revoked; fall back to browser
+            AnsiConsole.MarkupLine("[bold yellow]⚡ Session expired. Re-authenticating...[/]");
+            AnsiConsole.MarkupLine("[grey]A browser window will open for you to sign in.[/]");
+            AnsiConsole.WriteLine();
+
             result = await _app.AcquireTokenInteractive(_config.Scopes)
                 .WithPrompt(Prompt.SelectAccount)
                 .WithUseEmbeddedWebView(false)
@@ -154,15 +156,19 @@ public sealed class DeviceCodeAuthService : IAuthService
 
     public DeviceCodeAuthService(AzureAdConfig config) => _config = config;
 
-    private IPublicClientApplication BuildApp() =>
-        PublicClientApplicationBuilder
+    private async Task<IPublicClientApplication> BuildAppAsync()
+    {
+        var app = PublicClientApplicationBuilder
             .Create(_config.ClientId)
             .WithAuthority(AzureCloudInstance.AzurePublic, _config.TenantId)
             .Build();
+        await TokenCacheHelper.RegisterAsync(app);
+        return app;
+    }
 
     public async Task<AuthResult> AuthenticateAsync(CancellationToken ct = default)
     {
-        _app = BuildApp();
+        _app = await BuildAppAsync();
 
         var result = await _app.AcquireTokenWithDeviceCode(_config.Scopes, deviceCodeResult =>
         {
@@ -203,5 +209,50 @@ public sealed class DeviceCodeAuthService : IAuthService
         var result = await _app.AcquireTokenSilent(_config.Scopes, account).ExecuteAsync(ct);
         _lastResult = result;
         return result.AccessToken;
+    }
+}
+
+/// <summary>
+/// Manages a persistent MSAL token cache stored on disk.
+/// On Windows the file is DPAPI-encrypted; macOS uses Keychain; Linux uses SecretService.
+/// </summary>
+internal static class TokenCacheHelper
+{
+    private static readonly string CacheDir = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "EmailDownloader");
+
+    private const string CacheFileName = "token_cache.bin";
+
+    public static async Task RegisterAsync(IPublicClientApplication app)
+    {
+        var props = new StorageCreationPropertiesBuilder(CacheFileName, CacheDir)
+            .WithMacKeyChain("EmailDownloader", "TokenCache")
+            .WithLinuxKeyring(
+                "EmailDownloader.secrets",
+                MsalCacheHelper.LinuxKeyRingDefaultCollection,
+                "EmailDownloader Token Cache",
+                new KeyValuePair<string, string>("Version", "1"),
+                new KeyValuePair<string, string>("ProductGroup", "EmailDownloader"))
+            .Build();
+
+        var helper = await MsalCacheHelper.CreateAsync(props);
+        helper.RegisterCache(app.UserTokenCache);
+    }
+
+    /// <summary>
+    /// Returns the cached account's email/username if a valid session exists, otherwise null.
+    /// </summary>
+    public static async Task<string?> GetCachedAccountEmailAsync(AzureAdConfig config)
+    {
+        var app = PublicClientApplicationBuilder
+            .Create(config.ClientId)
+            .WithAuthority(AzureCloudInstance.AzurePublic, config.TenantId)
+            .WithRedirectUri(config.RedirectUri)
+            .Build();
+
+        await RegisterAsync(app);
+        var accounts = await app.GetAccountsAsync();
+        return accounts.FirstOrDefault()?.Username;
     }
 }

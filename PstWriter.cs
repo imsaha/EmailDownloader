@@ -37,7 +37,10 @@ public sealed class PstWriter : IPstWriter
         ct.ThrowIfCancellationRequested();
 
         var folderName = string.IsNullOrEmpty(message.FolderName) ? "Inbox" : message.FolderName;
-        var dir = Path.Combine(GetOutputPath(message.Year), SanitizeName(folderName));
+        // FolderName may be a slash-separated path (e.g. "Inbox/Work/Projects").
+        // Sanitize each segment individually so subdirectory hierarchy is preserved.
+        var segments = folderName.Split('/').Select(SanitizeName).ToArray();
+        var dir = Path.Combine(new[] { GetOutputPath(message.Year) }.Concat(segments).ToArray());
 
         if (_createdDirs.Add(dir))
             Directory.CreateDirectory(dir);

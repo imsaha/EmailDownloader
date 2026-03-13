@@ -51,45 +51,85 @@ public sealed class GraphEmailService : IEmailService
     {
         var client = await GetClientAsync(ct);
         var folders = new List<MailFolder>();
+        await FetchFoldersRecursiveAsync(client, parentFolderId: null, parentPath: string.Empty,
+            isTopLevel: true, result: folders, ct);
+        return folders;
+    }
 
-        var response = await client.Me.MailFolders.GetAsync(req =>
+    private async Task FetchFoldersRecursiveAsync(
+        GraphServiceClient client,
+        string? parentFolderId,
+        string parentPath,
+        bool isTopLevel,
+        List<MailFolder> result,
+        CancellationToken ct)
+    {
+        Microsoft.Graph.Models.MailFolderCollectionResponse? page;
+
+        if (parentFolderId == null)
         {
-            req.QueryParameters.Top = 50;
-            req.QueryParameters.IncludeHiddenFolders = "true";
-        }, ct);
+            page = await client.Me.MailFolders.GetAsync(req =>
+            {
+                req.QueryParameters.Top = 50;
+                req.QueryParameters.IncludeHiddenFolders = "true";
+            }, ct);
+        }
+        else
+        {
+            page = await client.Me.MailFolders[parentFolderId].ChildFolders.GetAsync(req =>
+            {
+                req.QueryParameters.Top = 50;
+            }, ct);
+        }
 
-        var page = response;
         while (page?.Value != null)
         {
             foreach (var f in page.Value)
             {
-                var shouldInclude = _config.IncludeFolders.Length == 0
+                var displayName = f.DisplayName ?? "";
+                var path = string.IsNullOrEmpty(parentPath) ? displayName : $"{parentPath}/{displayName}";
+
+                // IncludeFolders only filters top-level folders; nested children are always included.
+                // ExcludeFolders applies at every depth — excluded folders and their children are skipped.
+                var shouldInclude = !isTopLevel
+                    || _config.IncludeFolders.Length == 0
                     || _config.IncludeFolders.Any(inc =>
-                        inc.Equals(f.DisplayName, StringComparison.OrdinalIgnoreCase));
+                        inc.Equals(displayName, StringComparison.OrdinalIgnoreCase));
 
                 var shouldExclude = _config.ExcludeFolders.Any(exc =>
-                    exc.Equals(f.DisplayName, StringComparison.OrdinalIgnoreCase));
+                    exc.Equals(displayName, StringComparison.OrdinalIgnoreCase));
 
                 if (shouldInclude && !shouldExclude)
                 {
-                    folders.Add(new MailFolder
+                    result.Add(new MailFolder
                     {
                         Id = f.Id ?? "",
-                        DisplayName = f.DisplayName ?? "",
+                        DisplayName = displayName,
                         TotalItemCount = f.TotalItemCount ?? 0,
                         UnreadItemCount = f.UnreadItemCount ?? 0,
-                        ParentFolderId = f.ParentFolderId ?? ""
+                        ParentFolderId = f.ParentFolderId ?? "",
+                        Path = path,
+                        ChildFolderCount = f.ChildFolderCount ?? 0
                     });
+
+                    if ((f.ChildFolderCount ?? 0) > 0)
+                    {
+                        await FetchFoldersRecursiveAsync(client, f.Id, path,
+                            isTopLevel: false, result, ct);
+                    }
                 }
             }
 
             if (page.OdataNextLink == null) break;
-            page = await client.Me.MailFolders
-                .WithUrl(page.OdataNextLink)
-                .GetAsync(cancellationToken: ct);
-        }
 
-        return folders;
+            page = parentFolderId == null
+                ? await client.Me.MailFolders
+                    .WithUrl(page.OdataNextLink)
+                    .GetAsync(cancellationToken: ct)
+                : await client.Me.MailFolders[parentFolderId].ChildFolders
+                    .WithUrl(page.OdataNextLink)
+                    .GetAsync(cancellationToken: ct);
+        }
     }
 
     public async IAsyncEnumerable<EmailMessage> GetMessagesAsync(
@@ -206,7 +246,7 @@ public sealed class GraphEmailService : IEmailService
                         }
                     }
 
-                    var emailMsg = MapToEmailMessage(fullMsg, folder.DisplayName, attachments);
+                    var emailMsg = MapToEmailMessage(fullMsg, folder.Path, attachments);
                     stats.Downloaded++;
                     stats.Elapsed = sw.Elapsed;
 
