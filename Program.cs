@@ -17,6 +17,10 @@ static internal class Program
     private static async Task<int> Main(string[] args)
     {
         Console.OutputEncoding = System.Text.Encoding.UTF8;
+
+        if (args.Length > 0 && args[0].Equals("uninstall", StringComparison.OrdinalIgnoreCase))
+            return Uninstall();
+
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) =>
         {
@@ -37,6 +41,52 @@ static internal class Program
             PressAnyKey();
             return 0;
         }
+    }
+
+    private static int Uninstall()
+    {
+        var installDir = Path.GetDirectoryName(Environment.ProcessPath)!;
+
+        AnsiConsole.Write(new Rule("[bold red]Uninstall emaildl[/]").RuleStyle("red"));
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine($"[white]Install directory:[/] [grey]{installDir}[/]");
+        AnsiConsole.WriteLine();
+
+        var confirm = AnsiConsole.Prompt(
+            new SelectionPrompt<string>()
+                .Title("[bold]This will delete the install directory and remove it from PATH. Continue?[/]")
+                .AddChoices("Yes, uninstall", "No, cancel"));
+
+        if (confirm.StartsWith("No"))
+        {
+            AnsiConsole.MarkupLine("[grey]Uninstall cancelled.[/]");
+            return 0;
+        }
+
+        // Remove from user PATH
+        var currentPath = Environment.GetEnvironmentVariable("PATH", EnvironmentVariableTarget.User) ?? "";
+        var entries = currentPath.Split(';').Where(e => !e.TrimEnd('\\', '/').Equals(
+            installDir.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase));
+        Environment.SetEnvironmentVariable("PATH", string.Join(';', entries), EnvironmentVariableTarget.User);
+        AnsiConsole.MarkupLine("[green]Removed from PATH.[/]");
+
+        // Schedule directory deletion after process exits (can't delete the running exe on Windows)
+        var bat = Path.Combine(Path.GetTempPath(), "emaildl_uninstall.bat");
+        File.WriteAllText(bat,
+            $"""
+            @echo off
+            ping -n 3 127.0.0.1 >nul
+            rd /s /q "{installDir}"
+            del "%~f0"
+            """);
+        Process.Start(new ProcessStartInfo("cmd.exe", $"/c \"{bat}\"")
+        {
+            CreateNoWindow = true,
+            UseShellExecute = false
+        });
+
+        AnsiConsole.MarkupLine("[green]emaildl uninstalled.[/]");
+        return 0;
     }
 
     private const int RestartCode = -99;
